@@ -379,6 +379,24 @@ namespace Parser
             return std::make_unique<AST::FunctionAST>(std::move(Proto), std::move(E));
         return nullptr;
     }
+
+    /// external ::= 'extern' prototype
+    static std::unique_ptr<AST::PrototypeAST> ParseExtern()
+    {
+        getNextToken();  // eat extern.
+        return ParsePrototype();
+    }
+
+    /// toplevelexpr ::= expression
+    static std::unique_ptr<AST::FunctionAST> ParseTopLevelExpr()
+    {
+        if (auto E = ParseExpression()) {
+            // Make an anonymous proto.
+            auto Proto = std::make_unique<AST::PrototypeAST>("", std::vector<std::string>());
+            return std::make_unique<AST::FunctionAST>(std::move(Proto), std::move(E));
+        }
+        return nullptr;
+    }
 }
 
 #pragma endregion PARSER
