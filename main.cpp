@@ -1,6 +1,8 @@
+#include "llvm/IR/Value.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/Verifier.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 
 #include <iostream>
 #include <vector>
@@ -97,7 +99,9 @@ namespace AST
     class ExprAST
     {
     public:
-        virtual ~ExprAST() {}
+        virtual ~ExprAST() = default;
+
+        virtual llvm::Value *codegen() = 0;
     };
 
     /// NumberExprAST - Expression class for numeric literals like "1.0".
@@ -107,6 +111,8 @@ namespace AST
 
     public:
         NumberExprAST(double Val) : Val(Val) {}
+
+        llvm::Value *codegen() override;
     };
 
     /// VariableExprAST - Expression class for referencing a variable, like "a".
@@ -116,6 +122,8 @@ namespace AST
 
     public:
         VariableExprAST(const std::string &Name) : Name(Name) {}
+
+        llvm::Value *codegen() override;
     };
 
     /// BinaryExprAST - Expression class for a binary operator.
@@ -128,6 +136,8 @@ namespace AST
         BinaryExprAST(char op, std::unique_ptr<ExprAST> LHS,
                       std::unique_ptr<ExprAST> RHS)
                 : Op(op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+
+        llvm::Value *codegen() override;
     };
 
     /// CallExprAST - Expression class for function calls.
@@ -141,6 +151,8 @@ namespace AST
                     std::vector<std::unique_ptr<ExprAST>> Args)
                     : Callee(Callee)
                     , Args(std::move(Args)) {}
+
+        llvm::Value *codegen() override;
     };
 
     /// PrototypeAST - This class represents the "prototype" for a function,
@@ -156,6 +168,8 @@ namespace AST
                 : Name(name), Args(std::move(Args)) {}
 
         const std::string &getName() const { return Name; }
+
+        llvm::Function *codegen();
     };
 
     /// FunctionAST - This class represents a function definition itself.
@@ -168,6 +182,8 @@ namespace AST
         FunctionAST(std::unique_ptr<PrototypeAST> Proto,
                     std::unique_ptr<ExprAST> Body)
                 : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+        llvm::Function *codegen();
     };
 
 
@@ -464,6 +480,24 @@ namespace Parser
 }
 
 #pragma endregion PARSER
+
+#pragma region Code Generation
+//===----------------------------------------------------------------------===//
+// Code Generation
+//===----------------------------------------------------------------------===//
+
+static llvm::LLVMContext TheContext;
+static llvm::IRBuilder<> Builder(TheContext);
+static std::unique_ptr<llvm::Module> TheModule;
+static std::map<std::string, llvm::Value *> NamedValues;
+
+llvm::Value *LogErrorV(const char *Str)
+{
+    Parser::LogError(Str);
+    return nullptr;
+}
+
+#pragma endregion Code Generation
 
 int main() {
 //    std::cout << "Hello, World!" << std::endl;

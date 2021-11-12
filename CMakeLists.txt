@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.20)
 project(MyFirstLanguageFrontend)
 
 set(CMAKE_CXX_STANDARD 14)
@@ -19,3 +19,5 @@ set(LLVM_LINK_COMPONENTS
 #add_executable(MyFirstLanguageFrontend main.cpp)
 add_llvm_executable(MyFirstLanguageFrontend
         main.cpp)
+set_property(TARGET MyFirstLanguageFrontend PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
