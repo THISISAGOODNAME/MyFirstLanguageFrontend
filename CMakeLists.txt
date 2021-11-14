@@ -22,7 +22,9 @@ include(AddLLVM)
 
 set(LLVM_LINK_COMPONENTS
     Core
-    OrcJIT)
+    Support
+    OrcJIT
+    native)
 
 #add_executable(MyFirstLanguageFrontend main.cpp)
 add_llvm_executable(MyFirstLanguageFrontend

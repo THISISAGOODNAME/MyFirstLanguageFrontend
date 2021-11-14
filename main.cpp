@@ -12,6 +12,9 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 
+#include "KaleidoscopeJIT.h"
+#include "llvm/Support/TargetSelect.h"
+
 #include <iostream>
 #include <vector>
 #include <map>
@@ -420,7 +423,7 @@ namespace Parser
     {
         if (auto E = ParseExpression()) {
             // Make an anonymous proto.
-            auto Proto = std::make_unique<AST::PrototypeAST>("", std::vector<std::string>());
+            auto Proto = std::make_unique<AST::PrototypeAST>("__anon_expr", std::vector<std::string>());
             return std::make_unique<AST::FunctionAST>(std::move(Proto), std::move(E));
         }
         return nullptr;
@@ -440,6 +443,10 @@ static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::Value *> NamedValues;
 
 static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
+static std::map<std::string, std::unique_ptr<AST::PrototypeAST>> FunctionProtos;
+static llvm::ExitOnError ExitOnErr;
 
 llvm::Value *LogErrorV(const char *Str)
 {
@@ -484,10 +491,25 @@ llvm::Value *AST::BinaryExprAST::codegen()
     }
 }
 
+llvm::Function *getFunction(std::string Name)
+{
+    // First, see if the function has already been added to the current module.
+    if (auto *F = TheModule->getFunction(Name))
+        return F;
+
+    // If not, check whether we can codegen the declaration from some existing prototype.
+    auto FI = FunctionProtos.find(Name);
+    if (FI != FunctionProtos.end())
+        return FI->second->codegen();
+
+    // If no existing prototype exists, return null.
+    return nullptr;
+}
+
 llvm::Value *AST::CallExprAST::codegen()
 {
     // Look up the name in the global module table.
-    llvm::Function *CalleeF = TheModule->getFunction(Callee);
+    llvm::Function *CalleeF = getFunction(Callee);
     if (!CalleeF)
         return LogErrorV("Unknown function referenced");
 
@@ -521,12 +543,11 @@ llvm::Function *AST::PrototypeAST::codegen()
 }
 
 llvm::Function *AST::FunctionAST::codegen() {
-    // First, check for an existing function from a previous 'extern' declaration.
-    llvm::Function *TheFunction = TheModule->getFunction(Proto->getName());
-
-    if (!TheFunction)
-        TheFunction = Proto->codegen();
-
+    // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+    // reference to it for use below.
+    auto &P = *Proto;
+    FunctionProtos[Proto->getName()] = std::move(Proto);
+    llvm::Function *TheFunction = getFunction(P.getName());
     if (!TheFunction)
         return nullptr;
 
@@ -566,11 +587,12 @@ llvm::Function *AST::FunctionAST::codegen() {
 
 namespace TestDriver
 {
-    static void InitializeModule()
+    static void InitializeModuleAndPassManager()
     {
         // Open a new context and module.
         TheContext = std::make_unique<llvm::LLVMContext>();
         TheModule = std::make_unique<llvm::Module>("My first jit", *TheContext);
+        TheModule->setDataLayout(TheJIT->getDataLayout());
 
         // Create a new builder for the module.
         Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
@@ -597,6 +619,8 @@ namespace TestDriver
                 fprintf(stderr, "Read function definition: \n");
                 FnIR->print(llvm::errs());
                 fprintf(stderr, "\n");
+                ExitOnErr(TheJIT->addModule(llvm::orc::ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+                InitializeModuleAndPassManager();
             }
         } else {
             // Skip token for error recovery.
@@ -611,6 +635,7 @@ namespace TestDriver
                 fprintf(stderr, "Read extern: \n");
                 FnIR->print(llvm::errs());
                 fprintf(stderr, "\n");
+                FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
             }
         } else {
             // Skip token for error recovery.
@@ -623,12 +648,24 @@ namespace TestDriver
         // Evaluate a top-level expression into an anonymous function.
         if (auto FnAST = Parser::ParseTopLevelExpr()) {
             if (auto *FnIR = FnAST->codegen()) {
-                fprintf(stderr, "Read top-level expression: \n");
-                FnIR->print(llvm::errs());
-                fprintf(stderr, "\n");
+                // Create a ResourceTracker to track JIT'd memory allocated to our
+                // anonymous expression -- that way we can free it after executing.
+                auto RT = TheJIT->getMainJITDylib().createResourceTracker();
 
-                // Remove the anonymous expression.
-                FnIR->eraseFromParent();
+                auto TSM = llvm::orc::ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+                ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+                InitializeModuleAndPassManager();
+
+                // Search the JIT for the __anon_expr symbol.
+                auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+
+                // Get the symbol's address and cast it to the right type (takes no
+                // arguments, returns a double) so we can call it as a native function.
+                double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
+                fprintf(stderr, "Evaluated to %f\n", FP());
+
+                // Delete the anonymous expression module from the JIT.
+                ExitOnErr(RT->remove());
             }
         } else {
             // Skip token for error recovery.
@@ -663,11 +700,42 @@ namespace TestDriver
 }
 #pragma endregion JIT Driver
 
+#pragma region Extern Library
+//===----------------------------------------------------------------------===//
+// "Library" functions that can be "extern'd" from user code.
+//===----------------------------------------------------------------------===//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern "C" DLLEXPORT double putchard(double x)
+{
+    fputc((char)x, stderr);
+    return 0;
+}
+
+/// printd - printf that takes a double prints it as "%f\n", returning 0.
+extern "C" DLLEXPORT double printd(double x)
+{
+    fprintf(stderr, "%f\n", x);
+    return 0;
+}
+
+#pragma endregion Extern Library
+
 //===----------------------------------------------------------------------===//
 // Main driver code.
 //===----------------------------------------------------------------------===//
 int main() {
 //    std::cout << "Hello, World!" << std::endl;
+
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    llvm::InitializeNativeTargetAsmParser();
 
     // Install standard binary operators.
     // 1 is lowest precedence.
@@ -680,14 +748,13 @@ int main() {
     fprintf(stderr, "ready> ");
     Parser::getNextToken();
 
+    TheJIT = ExitOnErr(llvm::orc::KaleidoscopeJIT::Create());
+
     // Make the module, which holds all the code.
-    TestDriver::InitializeModule();
+    TestDriver::InitializeModuleAndPassManager();
 
     // Run the main "interpreter loop" now.
     TestDriver::MainLoop();
-
-    // Print out all of the generated code.
-    TheModule->print(llvm::errs(), nullptr);
 
     return 0;
 }
