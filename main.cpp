@@ -42,6 +42,8 @@ namespace Lexer {
         tok_if = -6,
         tok_then = -7,
         tok_else = -8,
+        tok_for = -9,
+        tok_in = -10,
     };
 
     static std::string IdentifierStr; // Filled in if tok_identifier
@@ -70,6 +72,10 @@ namespace Lexer {
                 return tok_then;
             if (IdentifierStr == "else")
                 return tok_else;
+            if (IdentifierStr == "for")
+                return tok_for;
+            if (IdentifierStr == "in")
+                return tok_in;
 
             return tok_identifier;
         }
@@ -222,6 +228,27 @@ namespace AST
 
         llvm::Value *codegen() override;
     };
+
+    /// ForExprAST - Expression class for for/in.
+    class ForExprAST : public ExprAST
+    {
+        std::string VarName;
+        std::unique_ptr<ExprAST> Start, End, Step, Body;
+
+    public:
+        ForExprAST(const std::string &VarName,
+                   std::unique_ptr<ExprAST> Start,
+                   std::unique_ptr<ExprAST> End,
+                   std::unique_ptr<ExprAST> Step,
+                   std::unique_ptr<ExprAST> Body)
+                   : VarName(VarName)
+                   , Start(std::move(Start))
+                   , End(std::move(End))
+                   , Step(std::move(Step))
+                   , Body(std::move(Body)) {}
+
+        llvm::Value *codegen() override;
+    };
 }
 
 #pragma endregion AST
@@ -359,10 +386,58 @@ namespace Parser
         return std::make_unique<AST::IfExprAST>(std::move(Cond), std::move(Then), std::move(Else));
     }
 
+    /// forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
+    static std::unique_ptr<AST::ExprAST> ParseForExpr() {
+        getNextToken();  // eat the for.
+
+        if (CurTok != Lexer::tok_identifier)
+            return LogError("expected identifier after for");
+
+        std::string IdName = Lexer::IdentifierStr;
+        getNextToken();  // eat identifier.
+
+        if (CurTok != '=')
+            return LogError("expected '=' after for");
+        getNextToken();  // eat '='.
+
+
+        auto Start = ParseExpression();
+        if (!Start)
+            return nullptr;
+        if (CurTok != ',')
+            return LogError("expected ',' after for start value");
+        getNextToken();
+
+        auto End = ParseExpression();
+        if (!End)
+            return nullptr;
+
+        // The step value is optional.
+        std::unique_ptr<AST::ExprAST> Step;
+        if (CurTok == ',') {
+            getNextToken();
+            Step = ParseExpression();
+            if (!Step)
+                return nullptr;
+        }
+
+        if (CurTok != Lexer::tok_in)
+            return LogError("expected 'in' after for");
+        getNextToken();  // eat 'in'.
+
+        auto Body = ParseExpression();
+        if (!Body)
+            return nullptr;
+
+        return std::make_unique<AST::ForExprAST>(IdName, std::move(Start), std::move(End), std::move(Step), std::move(Body));
+    }
+
     /// primary
     ///   ::= identifierexpr
     ///   ::= numberexpr
     ///   ::= parenexpr
+    ///   ::= ifexpr
+    ///   ::= forexpr
     static std::unique_ptr<AST::ExprAST> ParsePrimary()
     {
         switch (CurTok) {
@@ -376,6 +451,8 @@ namespace Parser
                 return ParseParenExpr();
             case Lexer::tok_if:
                 return ParseIfExpr();
+            case Lexer::tok_for:
+                return ParseForExpr();
         }
     }
 
@@ -689,6 +766,98 @@ llvm::Value *AST::IfExprAST::codegen()
     PN->addIncoming(ThenV, ThenBB);
     PN->addIncoming(ElseV, ElseBB);
     return PN;
+}
+
+// Output for-loop as:
+//   ...
+//   start = startexpr
+//   goto loop
+// loop:
+//   variable = phi [start, loopheader], [nextvariable, loopend]
+//   ...
+//   bodyexpr
+//   ...
+// loopend:
+//   step = stepexpr
+//   nextvariable = variable + step
+//   endcond = endexpr
+//   br endcond, loop, endloop
+// outloop:
+llvm::Value *AST::ForExprAST::codegen()
+{
+    // Emit the start code first, without 'variable' in scope.
+    llvm::Value *StartVal = Start->codegen();
+    if (!StartVal)
+        return nullptr;
+
+    // Make the new basic block for the loop header, inserting after current block.
+    llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
+    llvm::BasicBlock *PreheaderBB = Builder->GetInsertBlock();
+    llvm::BasicBlock *LoopBB = llvm::BasicBlock::Create(*TheContext, "loop", TheFunction);
+
+    // Insert an explicit fall through from the current block to the LoopBB.
+    Builder->CreateBr(LoopBB);
+
+    // Start insertion in LoopBB.
+    Builder->SetInsertPoint(LoopBB);
+
+    // Start the PHI node with an entry for Start.
+    llvm::PHINode *Variable = Builder->CreatePHI(llvm::Type::getDoubleTy(*TheContext), 2, VarName);
+    Variable->addIncoming(StartVal, PreheaderBB);
+
+    // Within the loop, the variable is defined equal to the PHI node.  If it
+    // shadows an existing variable, we have to restore it, so save it now.
+    llvm::Value *OldVal = NamedValues[VarName];
+    NamedValues[VarName] = Variable;
+
+    // Emit the body of the loop.  This, like any other expr, can change the
+    // current BB.  Note that we ignore the value computed by the body, but don't
+    // allow an error.
+    if (!Body->codegen())
+        return nullptr;
+
+    // Emit the step value.
+    llvm::Value *StepVal = nullptr;
+    if (Step) {
+        StepVal = Step->codegen();
+        if (!StepVal)
+            return nullptr;
+    } else {
+        // If not specified, use 1.0.
+        StepVal = llvm::ConstantFP::get(*TheContext, llvm::APFloat(1.0));
+    }
+
+    llvm::Value *NextVar = Builder->CreateFAdd(Variable, StepVal, "nextvar");
+
+    // Compute the end condition.
+    llvm::Value *EndCond = End->codegen();
+    if (!EndCond)
+        return nullptr;
+
+    // Convert condition to a bool by comparing non-equal to 0.0.
+    EndCond = Builder->CreateFCmpONE( EndCond, llvm::ConstantFP::get(*TheContext, llvm::APFloat(0.0)), "loopcond");
+
+    // Create the "after loop" block and insert it.
+    llvm::BasicBlock *LoopEndBB = Builder->GetInsertBlock();
+    llvm::BasicBlock *AfterBB = llvm::BasicBlock::Create(*TheContext, "afterloop", TheFunction);
+
+    // Insert the conditional branch into the end of LoopEndBB.
+    Builder->CreateCondBr(EndCond, LoopBB, AfterBB);
+
+    // Any new code will be inserted in AfterBB.
+    Builder->SetInsertPoint(AfterBB);
+
+    // Add a new entry to the PHI node for the backedge.
+    Variable->addIncoming(NextVar, LoopEndBB);
+
+    // Restore the unshadowed variable.
+    if (OldVal)
+        NamedValues[VarName] = OldVal;
+    else
+        NamedValues.erase(VarName);
+
+    // for expr always returns 0.0.
+    return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(*TheContext));
 }
 
 #pragma endregion Code Generation
