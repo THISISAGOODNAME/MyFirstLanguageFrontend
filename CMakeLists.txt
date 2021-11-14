@@ -3,7 +3,15 @@ project(MyFirstLanguageFrontend)
 
 set(CMAKE_CXX_STANDARD 14)
 
-set(LLVM_DIR "E:/theforge/llvm-project/my_build/lib/cmake/llvm")
+#set(LLVM_DIR "E:/theforge/llvm-project/my_build/lib/cmake/llvm")
+find_path(LLVM_DIR
+    NAMES AddLLVM.cmake
+    PATHS
+    "${LLVM_ROOT}"
+    "E:/theforge/llvm-project/my_build/lib/cmake/llvm"
+    "E:/workspace/llvm-project-llvmorg-13.0.0/my_build/lib/cmake/llvm"
+    NO_DEFAULT_PATH
+    )
 
 find_package(LLVM REQUIRED CONFIG)
 include_directories(${LLVM_INCLUDE_DIRS})
@@ -20,4 +28,4 @@ set(LLVM_LINK_COMPONENTS
 add_llvm_executable(MyFirstLanguageFrontend
         main.cpp)
 set_property(TARGET MyFirstLanguageFrontend PROPERTY
-        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
