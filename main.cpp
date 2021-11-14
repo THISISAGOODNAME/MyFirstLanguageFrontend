@@ -7,6 +7,11 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+
 #include <iostream>
 #include <vector>
 #include <map>
@@ -434,6 +439,8 @@ static std::unique_ptr<llvm::IRBuilder<>> Builder;
 static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::Value *> NamedValues;
 
+static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+
 llvm::Value *LogErrorV(const char *Str)
 {
     Parser::LogError(Str);
@@ -539,6 +546,9 @@ llvm::Function *AST::FunctionAST::codegen() {
         // Validate the generated code, checking for consistency.
         llvm::verifyFunction(*TheFunction);
 
+        // Optimize the function.
+        TheFPM->run(*TheFunction);
+
         return TheFunction;
     }
 
@@ -564,6 +574,20 @@ namespace TestDriver
 
         // Create a new builder for the module.
         Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+
+        // Create a new pass manager attached to it.
+        TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
+
+        // Do simple "peephole" optimizations and bit-twiddling optzns.
+        TheFPM->add(llvm::createInstructionCombiningPass());
+        // Reassociate expressions.
+        TheFPM->add(llvm::createReassociatePass());
+        // Eliminate Common SubExpressions.
+        TheFPM->add(llvm::createGVNPass());
+        // Simplify the control flow graph (deleting unreachable blocks, etc).
+        TheFPM->add(llvm::createCFGSimplificationPass());
+
+        TheFPM->doInitialization();
     }
 
     static void HandleDefinition()

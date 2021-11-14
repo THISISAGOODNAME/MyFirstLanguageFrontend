@@ -21,8 +21,8 @@ list(APPEND CMAKE_MODULE_PATH ${LLVM_CMAKE_DIR})
 include(AddLLVM)
 
 set(LLVM_LINK_COMPONENTS
-        Support
-        Analysis)
+    Core
+    OrcJIT)
 
 #add_executable(MyFirstLanguageFrontend main.cpp)
 add_llvm_executable(MyFirstLanguageFrontend
