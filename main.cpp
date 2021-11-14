@@ -37,6 +37,11 @@ namespace Lexer {
         // primary
         tok_identifier = -4,
         tok_number = -5,
+
+        // control
+        tok_if = -6,
+        tok_then = -7,
+        tok_else = -8,
     };
 
     static std::string IdentifierStr; // Filled in if tok_identifier
@@ -57,9 +62,14 @@ namespace Lexer {
 
             if (IdentifierStr == "def")
                 return tok_def;
-
             if (IdentifierStr == "extern")
                 return tok_extern;
+            if (IdentifierStr == "if")
+                return tok_if;
+            if (IdentifierStr == "then")
+                return tok_then;
+            if (IdentifierStr == "else")
+                return tok_else;
 
             return tok_identifier;
         }
@@ -197,7 +207,21 @@ namespace AST
         llvm::Function *codegen();
     };
 
+    /// IfExprAST - Expression class for if/then/else.
+    class IfExprAST : public ExprAST
+    {
+        std::unique_ptr<ExprAST> Cond, Then, Else;
 
+    public:
+        IfExprAST(std::unique_ptr<ExprAST> Cond,
+                  std::unique_ptr<ExprAST> Then,
+                  std::unique_ptr<ExprAST> Else)
+                  : Cond(std::move(Cond))
+                  , Then(std::move(Then))
+                  , Else(std::move(Else)) {}
+
+        llvm::Value *codegen() override;
+    };
 }
 
 #pragma endregion AST
@@ -305,6 +329,36 @@ namespace Parser
         return std::make_unique<AST::CallExprAST>(IdName, std::move(Args));
     }
 
+    /// ifexpr ::= 'if' expression 'then' expression 'else' expression
+    static std::unique_ptr<AST::ExprAST> ParseIfExpr()
+    {
+        getNextToken();  // eat the if.
+
+        // condition.
+        auto Cond = ParseExpression();
+        if (!Cond)
+            return nullptr;
+
+        if (CurTok != Lexer::tok_then)
+            return LogError("expected then");
+        getNextToken();  // eat the then
+
+        auto Then = ParseExpression();
+        if (!Then)
+            return nullptr;
+
+        if (CurTok != Lexer::tok_else)
+            return LogError("expected else");
+
+        getNextToken();
+
+        auto Else = ParseExpression();
+        if (!Else)
+            return nullptr;
+
+        return std::make_unique<AST::IfExprAST>(std::move(Cond), std::move(Then), std::move(Else));
+    }
+
     /// primary
     ///   ::= identifierexpr
     ///   ::= numberexpr
@@ -320,6 +374,8 @@ namespace Parser
                 return ParseNumberExpr();
             case '(':
                 return ParseParenExpr();
+            case Lexer::tok_if:
+                return ParseIfExpr();
         }
     }
 
@@ -570,12 +626,69 @@ llvm::Function *AST::FunctionAST::codegen() {
         // Optimize the function.
         TheFPM->run(*TheFunction);
 
+//        TheFunction->viewCFG();
+//        TheFunction->viewCFGOnly();
+
         return TheFunction;
     }
 
     // Error reading body, remove function.
     TheFunction->eraseFromParent();
     return nullptr;
+}
+
+llvm::Value *AST::IfExprAST::codegen()
+{
+    llvm::Value *CondV = Cond->codegen();
+    if (!CondV)
+        return nullptr;
+
+    // Convert condition to a bool by comparing non-equal to 0.0.
+    CondV = Builder->CreateFCmpONE(CondV, llvm::ConstantFP::get(*TheContext, llvm::APFloat(0.0)), "ifcond");
+
+    llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    // Create blocks for the then and else cases.  Insert the 'then' block at the end of the function.
+    // llvm::BasicBlock *ThenBB =llvm::BasicBlock::Create(*TheContext, "then", TheFunction);
+    llvm::BasicBlock *ThenBB = llvm::BasicBlock::Create(*TheContext, "then");
+    llvm::BasicBlock *ElseBB = llvm::BasicBlock::Create(*TheContext, "else");
+    llvm::BasicBlock *MergeBB = llvm::BasicBlock::Create(*TheContext, "ifcont");
+
+    Builder->CreateCondBr(CondV, ThenBB, ElseBB);
+
+    // Emit then block.
+    TheFunction->getBasicBlockList().push_back(ThenBB);
+    Builder->SetInsertPoint(ThenBB);
+
+    llvm::Value *ThenV = Then->codegen();
+    if (!ThenV)
+        return nullptr;
+
+    Builder->CreateBr(MergeBB);
+    // Codegen of 'Then' can change the current block, update ThenBB for the PHI.
+    ThenBB = Builder->GetInsertBlock();
+
+    // Emit else block.
+    TheFunction->getBasicBlockList().push_back(ElseBB);
+    Builder->SetInsertPoint(ElseBB);
+
+    llvm::Value *ElseV = Else->codegen();
+    if (!ElseV)
+        return nullptr;
+
+    Builder->CreateBr(MergeBB);
+    // Codegen of 'Else' can change the current block, update ElseBB for the PHI.
+    ElseBB = Builder->GetInsertBlock();
+
+    // Emit merge block.
+    TheFunction->getBasicBlockList().push_back(MergeBB);
+    Builder->SetInsertPoint(MergeBB);
+
+    llvm::PHINode *PN = Builder->CreatePHI(llvm::Type::getDoubleTy(*TheContext), 2, "iftmp");
+
+    PN->addIncoming(ThenV, ThenBB);
+    PN->addIncoming(ElseV, ElseBB);
+    return PN;
 }
 
 #pragma endregion Code Generation
