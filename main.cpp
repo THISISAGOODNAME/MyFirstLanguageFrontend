@@ -11,6 +11,7 @@
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Utils.h"
 
 #include "KaleidoscopeJIT.h"
 #include "llvm/Support/TargetSelect.h"
@@ -665,7 +666,7 @@ namespace Parser
 static std::unique_ptr<llvm::LLVMContext> TheContext;
 static std::unique_ptr<llvm::IRBuilder<>> Builder;
 static std::unique_ptr<llvm::Module> TheModule;
-static std::map<std::string, llvm::Value *> NamedValues;
+static std::map<std::string, llvm::AllocaInst *> NamedValues;
 
 static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
 
@@ -694,6 +695,13 @@ llvm::Function *getFunction(std::string Name)
     return nullptr;
 }
 
+/// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
+/// the function.  This is used for mutable variables etc.
+static llvm::AllocaInst *CreateEntryBlockAlloca(llvm::Function *TheFunction, const std::string &VarName) {
+    llvm::IRBuilder<> TmpB(&TheFunction->getEntryBlock(), TheFunction->getEntryBlock().begin());
+    return TmpB.CreateAlloca(llvm::Type::getDoubleTy(*TheContext), 0, VarName.c_str());
+}
+
 llvm::Value *AST::NumberExprAST::codegen()
 {
     return llvm::ConstantFP::get(*TheContext, llvm::APFloat(Val));
@@ -702,10 +710,12 @@ llvm::Value *AST::NumberExprAST::codegen()
 llvm::Value *AST::VariableExprAST::codegen()
 {
     // Look this variable up in the function.
-    llvm::Value *V = NamedValues[Name];
-    if (!V)
+    llvm::AllocaInst *A = NamedValues[Name];
+    if (!A)
         LogErrorV("Unknown variable name");
-    return V;
+
+    // Load the value.
+    return Builder->CreateLoad(A->getAllocatedType(), A, Name.c_str());
 }
 
 llvm::Value *AST::UnaryExprAST::codegen()
@@ -807,8 +817,17 @@ llvm::Function *AST::FunctionAST::codegen() {
 
     // Record the function arguments in the NamedValues map.
     NamedValues.clear();
-    for (auto &Arg : TheFunction->args())
-        NamedValues[std::string(Arg.getName())] = &Arg;
+    for (auto &Arg : TheFunction->args()) {
+        // Create an alloca for this variable.
+        llvm::AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, (std::string)Arg.getName());
+
+        // Store the initial value into the alloca.
+        Builder->CreateStore(&Arg, Alloca);
+
+        // Add arguments to variable symbol table.
+        NamedValues[std::string(Arg.getName())] = Alloca;
+    }
+
 
     if (llvm::Value *RetVal = Body->codegen()) {
         // Finish off the function.
@@ -886,30 +905,40 @@ llvm::Value *AST::IfExprAST::codegen()
 }
 
 // Output for-loop as:
+//   var = alloca double
 //   ...
 //   start = startexpr
+//   store start -> var
 //   goto loop
 // loop:
-//   variable = phi [start, loopheader], [nextvariable, loopend]
 //   ...
 //   bodyexpr
 //   ...
 // loopend:
 //   step = stepexpr
-//   nextvariable = variable + step
 //   endcond = endexpr
+//
+//   curvar = load var
+//   nextvar = curvar + step
+//   store nextvar -> var
 //   br endcond, loop, endloop
 // outloop:
 llvm::Value *AST::ForExprAST::codegen()
 {
+    llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    // Create an alloca for the variable in the entry block.
+    llvm::AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
     // Emit the start code first, without 'variable' in scope.
     llvm::Value *StartVal = Start->codegen();
     if (!StartVal)
         return nullptr;
 
+    // Store the value into the alloca.
+    Builder->CreateStore(StartVal, Alloca);
+
     // Make the new basic block for the loop header, inserting after current block.
-    llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
-    llvm::BasicBlock *PreheaderBB = Builder->GetInsertBlock();
     llvm::BasicBlock *LoopBB = llvm::BasicBlock::Create(*TheContext, "loop", TheFunction);
 
     // Insert an explicit fall through from the current block to the LoopBB.
@@ -918,14 +947,10 @@ llvm::Value *AST::ForExprAST::codegen()
     // Start insertion in LoopBB.
     Builder->SetInsertPoint(LoopBB);
 
-    // Start the PHI node with an entry for Start.
-    llvm::PHINode *Variable = Builder->CreatePHI(llvm::Type::getDoubleTy(*TheContext), 2, VarName);
-    Variable->addIncoming(StartVal, PreheaderBB);
-
     // Within the loop, the variable is defined equal to the PHI node.  If it
     // shadows an existing variable, we have to restore it, so save it now.
-    llvm::Value *OldVal = NamedValues[VarName];
-    NamedValues[VarName] = Variable;
+    llvm::AllocaInst *OldVal = NamedValues[VarName];
+    NamedValues[VarName] = Alloca;
 
     // Emit the body of the loop.  This, like any other expr, can change the
     // current BB.  Note that we ignore the value computed by the body, but don't
@@ -944,8 +969,6 @@ llvm::Value *AST::ForExprAST::codegen()
         StepVal = llvm::ConstantFP::get(*TheContext, llvm::APFloat(1.0));
     }
 
-    llvm::Value *NextVar = Builder->CreateFAdd(Variable, StepVal, "nextvar");
-
     // Compute the end condition.
     llvm::Value *EndCond = End->codegen();
     if (!EndCond)
@@ -955,7 +978,6 @@ llvm::Value *AST::ForExprAST::codegen()
     EndCond = Builder->CreateFCmpONE( EndCond, llvm::ConstantFP::get(*TheContext, llvm::APFloat(0.0)), "loopcond");
 
     // Create the "after loop" block and insert it.
-    llvm::BasicBlock *LoopEndBB = Builder->GetInsertBlock();
     llvm::BasicBlock *AfterBB = llvm::BasicBlock::Create(*TheContext, "afterloop", TheFunction);
 
     // Insert the conditional branch into the end of LoopEndBB.
@@ -963,9 +985,6 @@ llvm::Value *AST::ForExprAST::codegen()
 
     // Any new code will be inserted in AfterBB.
     Builder->SetInsertPoint(AfterBB);
-
-    // Add a new entry to the PHI node for the backedge.
-    Variable->addIncoming(NextVar, LoopEndBB);
 
     // Restore the unshadowed variable.
     if (OldVal)
@@ -999,6 +1018,8 @@ namespace TestDriver
         // Create a new pass manager attached to it.
         TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
 
+        // Promote allocas to registers.
+        TheFPM->add(llvm::createPromoteMemoryToRegisterPass());
         // Do simple "peephole" optimizations and bit-twiddling optzns.
         TheFPM->add(llvm::createInstructionCombiningPass());
         // Reassociate expressions.
