@@ -639,6 +639,21 @@ llvm::Value *LogErrorV(const char *Str)
     return nullptr;
 }
 
+llvm::Function *getFunction(std::string Name)
+{
+    // First, see if the function has already been added to the current module.
+    if (auto *F = TheModule->getFunction(Name))
+        return F;
+
+    // If not, check whether we can codegen the declaration from some existing prototype.
+    auto FI = FunctionProtos.find(Name);
+    if (FI != FunctionProtos.end())
+        return FI->second->codegen();
+
+    // If no existing prototype exists, return null.
+    return nullptr;
+}
+
 llvm::Value *AST::NumberExprAST::codegen()
 {
     return llvm::ConstantFP::get(*TheContext, llvm::APFloat(Val));
@@ -672,23 +687,16 @@ llvm::Value *AST::BinaryExprAST::codegen()
             // Convert bool 0/1 to double 0.0 or 1.0
             return Builder->CreateUIToFP(L, llvm::Type::getDoubleTy(*TheContext), "booltmp");
         default:
-            return LogErrorV("invalid binary operator");
+            break;
     }
-}
 
-llvm::Function *getFunction(std::string Name)
-{
-    // First, see if the function has already been added to the current module.
-    if (auto *F = TheModule->getFunction(Name))
-        return F;
+    // If it wasn't a builtin binary operator, it must be a user defined one. Emit
+    // a call to it.
+    llvm::Function *F = getFunction(std::string("binary") + Op);
+    assert(F && "binary operator not found!");
 
-    // If not, check whether we can codegen the declaration from some existing prototype.
-    auto FI = FunctionProtos.find(Name);
-    if (FI != FunctionProtos.end())
-        return FI->second->codegen();
-
-    // If no existing prototype exists, return null.
-    return nullptr;
+    llvm::Value *Ops[2] = { L, R };
+    return Builder->CreateCall(F, Ops, "binop");
 }
 
 llvm::Value *AST::CallExprAST::codegen()
@@ -735,6 +743,10 @@ llvm::Function *AST::FunctionAST::codegen() {
     llvm::Function *TheFunction = getFunction(P.getName());
     if (!TheFunction)
         return nullptr;
+
+    // If this is an operator, install it.
+    if (P.isBinaryOp())
+        Parser::BinopPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
 
     // Create a new basic block to start insertion into.
     llvm::BasicBlock *BB = llvm::BasicBlock::Create(*TheContext, "entry", TheFunction);
