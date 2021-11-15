@@ -44,6 +44,10 @@ namespace Lexer {
         tok_else = -8,
         tok_for = -9,
         tok_in = -10,
+
+        // operators
+        tok_binary = -11,
+        tok_unary = -12,
     };
 
     static std::string IdentifierStr; // Filled in if tok_identifier
@@ -76,6 +80,11 @@ namespace Lexer {
                 return tok_for;
             if (IdentifierStr == "in")
                 return tok_in;
+
+            if (IdentifierStr == "binary")
+                return tok_binary;
+            if (IdentifierStr == "unary")
+                return tok_unary;
 
             return tok_identifier;
         }
@@ -190,13 +199,26 @@ namespace AST
         std::string Name;
         std::vector<std::string> Args;
 
+        bool IsOperator;
+        unsigned Precedence;  // Precedence if a binary op.
+
     public:
-        PrototypeAST(const std::string &name, std::vector<std::string> Args)
-                : Name(name), Args(std::move(Args)) {}
+        PrototypeAST(const std::string &name, std::vector<std::string> Args, bool IsOperator = false, unsigned Prec = 0)
+        : Name(name), Args(std::move(Args)), IsOperator(IsOperator), Precedence(Prec) {}
 
         const std::string &getName() const { return Name; }
 
         llvm::Function *codegen();
+
+        bool isUnaryOp() const { return IsOperator && Args.size() == 1; }
+        bool isBinaryOp() const { return IsOperator && Args.size() == 2; }
+
+        char getOperatorName() const {
+            assert(isUnaryOp() || isBinaryOp());
+            return Name[Name.size() - 1];
+        }
+
+        unsigned getBinaryPrecedence() const { return Precedence; }
     };
 
     /// FunctionAST - This class represents a function definition itself.
@@ -507,18 +529,44 @@ namespace Parser
 
     /// prototype
     ///   ::= id '(' id* ')'
+    ///   ::= binary LETTER number? (id, id)
     static std::unique_ptr<AST::PrototypeAST> ParsePrototype()
     {
-        if (CurTok != Lexer::tok_identifier)
-            return LogErrorP("Expected function name in prototype");
+        std::string FnName;
 
-        std::string FnName = Lexer::IdentifierStr;
-        getNextToken();
+        unsigned Kind = 0;  // 0 = identifier, 1 = unary, 2 = binary.
+        unsigned BinaryPrecedence = 30;
+
+        switch (CurTok) {
+            default:
+                return LogErrorP("Expected function name in prototype");
+            case Lexer::tok_identifier:
+                FnName = Lexer::IdentifierStr;
+                Kind = 0;
+                getNextToken();
+                break;
+            case Lexer::tok_binary:
+                getNextToken();
+                if (!isascii(CurTok))
+                    return LogErrorP("Expected binary operator");
+                FnName = "binary";
+                FnName += (char)CurTok;
+                Kind = 2;
+                getNextToken();
+
+                // Read the precedence if present.
+                if (CurTok == Lexer::tok_number) {
+                    if (Lexer::NumVal < 1 || Lexer::NumVal > 100)
+                        return LogErrorP("Invalid precedence: must be 1..100");
+                    BinaryPrecedence = (unsigned)Lexer::NumVal;
+                    getNextToken();
+                }
+                break;
+        }
 
         if (CurTok != '(')
             return LogErrorP("Expected '(' in prototype");
 
-        // Read the list of argument names.
         std::vector<std::string> ArgNames;
         while (getNextToken() == Lexer::tok_identifier)
             ArgNames.push_back(Lexer::IdentifierStr);
@@ -528,7 +576,11 @@ namespace Parser
         // success.
         getNextToken();  // eat ')'.
 
-        return std::make_unique<AST::PrototypeAST>(FnName, std::move(ArgNames));
+        // Verify right number of names for operator.
+        if (Kind && ArgNames.size() != Kind)
+            return LogErrorP("Invalid number of operands for operator");
+
+        return std::make_unique<AST::PrototypeAST>(FnName, std::move(ArgNames), Kind != 0, BinaryPrecedence);
     }
 
     /// definition
