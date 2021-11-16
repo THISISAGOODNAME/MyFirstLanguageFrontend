@@ -161,6 +161,7 @@ namespace AST
         VariableExprAST(const std::string &Name) : Name(Name) {}
 
         llvm::Value *codegen() override;
+        const std::string &getName() const { return Name; }
     };
 
     /// BinaryExprAST - Expression class for a binary operator.
@@ -733,6 +734,29 @@ llvm::Value *AST::UnaryExprAST::codegen()
 
 llvm::Value *AST::BinaryExprAST::codegen()
 {
+    // Special case '=' because we don't want to emit the LHS as an expression.
+    if (Op == '=') {
+        // Assignment requires the LHS to be an identifier.
+        // This assume we're building without RTTI because LLVM builds that way by
+        // default.  If you build LLVM with RTTI this can be changed to a
+        // dynamic_cast for automatic error checking.
+        AST::VariableExprAST *LHSE = static_cast<AST::VariableExprAST *>(LHS.get());
+        if (!LHSE)
+            return LogErrorV("destination of '=' must be a variable");
+        // Codegen the RHS.
+        llvm::Value *Val = RHS->codegen();
+        if (!Val)
+            return nullptr;
+
+        // Look up the name.
+        llvm::Value *Variable = NamedValues[LHSE->getName()];
+        if (!Variable)
+            return LogErrorV("Unknown variable name");
+
+        Builder->CreateStore(Val, Variable);
+        return Val;
+    }
+
     llvm::Value *L = LHS->codegen();
     llvm::Value *R = RHS->codegen();
     if (!L || !R)
@@ -1159,6 +1183,7 @@ int main() {
 
     // Install standard binary operators.
     // 1 is lowest precedence.
+    Parser::BinopPrecedence['='] = 2;
     Parser::BinopPrecedence['<'] = 10;
     Parser::BinopPrecedence['+'] = 20;
     Parser::BinopPrecedence['-'] = 20;
