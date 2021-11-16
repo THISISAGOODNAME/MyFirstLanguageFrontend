@@ -1,4 +1,4 @@
-#include "Warning.h"
+#include "../Warning.h"
 
 #include "llvm/IR/Value.h"
 #include "llvm/IR/Type.h"
@@ -13,7 +13,7 @@
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Utils.h"
 
-#include "KaleidoscopeJIT.h"
+#include "../KaleidoscopeJIT.h"
 #include "llvm/Support/TargetSelect.h"
 
 #include <iostream>
@@ -206,8 +206,8 @@ namespace AST
     public:
         CallExprAST(const std::string &Callee,
                     std::vector<std::unique_ptr<ExprAST>> Args)
-                    : Callee(Callee)
-                    , Args(std::move(Args)) {}
+                : Callee(Callee)
+                , Args(std::move(Args)) {}
 
         llvm::Value *codegen() override;
     };
@@ -225,7 +225,7 @@ namespace AST
 
     public:
         PrototypeAST(const std::string &name, std::vector<std::string> Args, bool IsOperator = false, unsigned Prec = 0)
-        : Name(name), Args(std::move(Args)), IsOperator(IsOperator), Precedence(Prec) {}
+                : Name(name), Args(std::move(Args)), IsOperator(IsOperator), Precedence(Prec) {}
 
         const std::string &getName() const { return Name; }
 
@@ -265,9 +265,9 @@ namespace AST
         IfExprAST(std::unique_ptr<ExprAST> Cond,
                   std::unique_ptr<ExprAST> Then,
                   std::unique_ptr<ExprAST> Else)
-                  : Cond(std::move(Cond))
-                  , Then(std::move(Then))
-                  , Else(std::move(Else)) {}
+                : Cond(std::move(Cond))
+                , Then(std::move(Then))
+                , Else(std::move(Else)) {}
 
         llvm::Value *codegen() override;
     };
@@ -284,11 +284,11 @@ namespace AST
                    std::unique_ptr<ExprAST> End,
                    std::unique_ptr<ExprAST> Step,
                    std::unique_ptr<ExprAST> Body)
-                   : VarName(VarName)
-                   , Start(std::move(Start))
-                   , End(std::move(End))
-                   , Step(std::move(Step))
-                   , Body(std::move(Body)) {}
+                : VarName(VarName)
+                , Start(std::move(Start))
+                , End(std::move(End))
+                , Step(std::move(Step))
+                , Body(std::move(Body)) {}
 
         llvm::Value *codegen() override;
     };

@@ -28,6 +28,11 @@ set(LLVM_LINK_COMPONENTS
 
 #add_executable(MyFirstLanguageFrontend main.cpp)
 add_llvm_executable(MyFirstLanguageFrontend
-        main.cpp)
+        MyFirstLanguageFrontend/main.cpp)
 set_property(TARGET MyFirstLanguageFrontend PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
+add_llvm_executable(klc
+        klc/klc.cpp)
+set_property(TARGET klc PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
