@@ -13,8 +13,13 @@
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Utils.h"
 
-#include "../KaleidoscopeJIT.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/Host.h"
+#include "llvm/Support/TargetRegistry.h"
+
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
 
 #include <iostream>
 #include <vector>
@@ -740,9 +745,8 @@ static std::unique_ptr<llvm::IRBuilder<>> Builder;
 static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::AllocaInst *> NamedValues;
 
-static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+//static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
 
-static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<AST::PrototypeAST>> FunctionProtos;
 static llvm::ExitOnError ExitOnErr;
 
@@ -932,7 +936,7 @@ llvm::Function *AST::FunctionAST::codegen() {
         llvm::verifyFunction(*TheFunction);
 
         // Optimize the function.
-        TheFPM->run(*TheFunction);
+//        TheFPM->run(*TheFunction);
 
 //        TheFunction->viewCFG();
 //        TheFunction->viewCFGOnly();
@@ -1154,26 +1158,25 @@ namespace TestDriver
         // Open a new context and module.
         TheContext = std::make_unique<llvm::LLVMContext>();
         TheModule = std::make_unique<llvm::Module>("My first jit", *TheContext);
-        TheModule->setDataLayout(TheJIT->getDataLayout());
 
         // Create a new builder for the module.
         Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
 
-        // Create a new pass manager attached to it.
-        TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
-
-        // Promote allocas to registers.
-        TheFPM->add(llvm::createPromoteMemoryToRegisterPass());
-        // Do simple "peephole" optimizations and bit-twiddling optzns.
-        TheFPM->add(llvm::createInstructionCombiningPass());
-        // Reassociate expressions.
-        TheFPM->add(llvm::createReassociatePass());
-        // Eliminate Common SubExpressions.
-        TheFPM->add(llvm::createGVNPass());
-        // Simplify the control flow graph (deleting unreachable blocks, etc).
-        TheFPM->add(llvm::createCFGSimplificationPass());
-
-        TheFPM->doInitialization();
+//        // Create a new pass manager attached to it.
+//        TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
+//
+//        // Promote allocas to registers.
+//        TheFPM->add(llvm::createPromoteMemoryToRegisterPass());
+//        // Do simple "peephole" optimizations and bit-twiddling optzns.
+//        TheFPM->add(llvm::createInstructionCombiningPass());
+//        // Reassociate expressions.
+//        TheFPM->add(llvm::createReassociatePass());
+//        // Eliminate Common SubExpressions.
+//        TheFPM->add(llvm::createGVNPass());
+//        // Simplify the control flow graph (deleting unreachable blocks, etc).
+//        TheFPM->add(llvm::createCFGSimplificationPass());
+//
+//        TheFPM->doInitialization();
     }
 
     static void HandleDefinition()
@@ -1183,8 +1186,6 @@ namespace TestDriver
                 fprintf(stderr, "Read function definition: \n");
                 FnIR->print(llvm::errs());
                 fprintf(stderr, "\n");
-                ExitOnErr(TheJIT->addModule(llvm::orc::ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
-                InitializeModuleAndPassManager();
             }
         } else {
             // Skip token for error recovery.
@@ -1211,26 +1212,7 @@ namespace TestDriver
     {
         // Evaluate a top-level expression into an anonymous function.
         if (auto FnAST = Parser::ParseTopLevelExpr()) {
-            if (auto *FnIR = FnAST->codegen()) {
-                // Create a ResourceTracker to track JIT'd memory allocated to our
-                // anonymous expression -- that way we can free it after executing.
-                auto RT = TheJIT->getMainJITDylib().createResourceTracker();
-
-                auto TSM = llvm::orc::ThreadSafeModule(std::move(TheModule), std::move(TheContext));
-                ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
-                InitializeModuleAndPassManager();
-
-                // Search the JIT for the __anon_expr symbol.
-                auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
-
-                // Get the symbol's address and cast it to the right type (takes no
-                // arguments, returns a double) so we can call it as a native function.
-                double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
-                fprintf(stderr, "Evaluated to %f\n", FP());
-
-                // Delete the anonymous expression module from the JIT.
-                ExitOnErr(RT->remove());
-            }
+            FnAST->codegen();
         } else {
             // Skip token for error recovery.
             Parser::getNextToken();
@@ -1309,10 +1291,6 @@ extern "C" DLLEXPORT double msgboxd(double x)
 int main() {
 //    std::cout << "Hello, World!" << std::endl;
 
-    llvm::InitializeNativeTarget();
-    llvm::InitializeNativeTargetAsmPrinter();
-    llvm::InitializeNativeTargetAsmParser();
-
     // Install standard binary operators.
     // 1 is lowest precedence.
     Parser::BinopPrecedence['='] = 2;
@@ -1325,13 +1303,68 @@ int main() {
     fprintf(stderr, "ready> ");
     Parser::getNextToken();
 
-    TheJIT = ExitOnErr(llvm::orc::KaleidoscopeJIT::Create());
-
     // Make the module, which holds all the code.
     TestDriver::InitializeModuleAndPassManager();
 
     // Run the main "interpreter loop" now.
     TestDriver::MainLoop();
+
+    // Initialize the target registry etc.
+//    llvm::InitializeAllTargetInfos();
+//    llvm::InitializeAllTargets();
+//    llvm::InitializeAllTargetMCs();
+//    llvm::InitializeAllAsmParsers();
+//    llvm::InitializeAllAsmPrinters();
+
+    LLVMInitializeX86TargetInfo();
+    LLVMInitializeX86Target();
+    LLVMInitializeX86TargetMC();
+    LLVMInitializeX86AsmPrinter();
+    LLVMInitializeX86AsmParser();
+
+    auto TargetTriple = llvm::sys::getDefaultTargetTriple();
+    TheModule->setTargetTriple(TargetTriple);
+
+    std::string Error;
+    auto Target = llvm::TargetRegistry::lookupTarget(TargetTriple, Error);
+
+    // Print an error and exit if we couldn't find the requested target.
+    // This generally occurs if we've forgotten to initialise the
+    // TargetRegistry or we have a bogus target triple.
+    if (!Target) {
+        llvm::errs() << Error;
+        return 1;
+    }
+
+    auto CPU = "generic";
+    auto Features = "";
+//    auto Features = "avx";
+
+    llvm::TargetOptions opt;
+    auto RM = llvm::Optional<llvm::Reloc::Model>();
+    auto TargetMachine = Target->createTargetMachine(TargetTriple, CPU, Features, opt, RM);
+
+    TheModule->setDataLayout(TargetMachine->createDataLayout());
+
+    auto Filename = "output.o";
+    std::error_code EC;
+    llvm::raw_fd_ostream dest(Filename, EC, llvm::sys::fs::OF_None);
+
+    if (EC) {
+        llvm::errs() << "Could not open file: " << EC.message();
+        return 1;
+    }
+
+    llvm::legacy::PassManager pass;
+    auto FileType = llvm::CGFT_ObjectFile;
+
+    if (TargetMachine->addPassesToEmitFile(pass, dest, nullptr, FileType)) {
+        llvm::errs() << "TargetMachine can't emit a file of this type";
+        return 1;
+    }
+
+    pass.run(*TheModule);
+    dest.flush();
 
     return 0;
 }

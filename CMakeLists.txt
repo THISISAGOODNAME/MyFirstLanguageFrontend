@@ -24,7 +24,8 @@ set(LLVM_LINK_COMPONENTS
     Core
     Support
     OrcJIT
-    native)
+    native
+    all)
 
 #add_executable(MyFirstLanguageFrontend main.cpp)
 add_llvm_executable(MyFirstLanguageFrontend
@@ -36,3 +37,6 @@ add_llvm_executable(klc
         klc/klc.cpp)
 set_property(TARGET klc PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
+add_executable(klctest
+        tests/NativeCompile/testfib.cpp tests/NativeCompile/output.o)
