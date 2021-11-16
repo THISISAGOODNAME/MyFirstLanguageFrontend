@@ -1289,6 +1289,18 @@ extern "C" DLLEXPORT double printd(double x)
     return 0;
 }
 
+#ifdef _WIN32
+/// msgboxd - MessageBox on win32
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+extern "C" DLLEXPORT double msgboxd(double x)
+{
+    std::string showMsg = "x = " + std::to_string(x) + "\n";
+    MessageBox(NULL, (LPCSTR)(showMsg.c_str()), (LPCSTR)("Show value!"), MB_ICONWARNING | MB_CANCELTRYCONTINUE | MB_DEFBUTTON2);
+    return 0;
+}
+#endif
+
 #pragma endregion Extern Library
 
 //===----------------------------------------------------------------------===//
