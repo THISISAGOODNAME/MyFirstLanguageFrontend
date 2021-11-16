@@ -1212,7 +1212,8 @@ namespace TestDriver
     {
         // Evaluate a top-level expression into an anonymous function.
         if (auto FnAST = Parser::ParseTopLevelExpr()) {
-            FnAST->codegen();
+            if (!FnAST->codegen())
+                fprintf(stderr, "Error generating code for top level expr");
         } else {
             // Skip token for error recovery.
             Parser::getNextToken();
@@ -1224,7 +1225,6 @@ namespace TestDriver
     {
         while (1)
         {
-            fprintf(stderr, "ready> ");
             switch (Parser::CurTok) {
                 case Lexer::tok_eof:
                     return;
@@ -1300,7 +1300,6 @@ int main() {
     Parser::BinopPrecedence['*'] = 40; // highest.
 
     // Prime the first token.
-    fprintf(stderr, "ready> ");
     Parser::getNextToken();
 
     // Make the module, which holds all the code.
