@@ -49,6 +49,9 @@ namespace Lexer {
         // operators
         tok_binary = -11,
         tok_unary = -12,
+
+        // var definition
+        tok_var = -13,
     };
 
     static std::string IdentifierStr; // Filled in if tok_identifier
@@ -86,6 +89,9 @@ namespace Lexer {
                 return tok_binary;
             if (IdentifierStr == "unary")
                 return tok_unary;
+
+            if (IdentifierStr == "var")
+                return tok_var;
 
             return tok_identifier;
         }
@@ -286,6 +292,22 @@ namespace AST
 
         llvm::Value *codegen() override;
     };
+
+    /// VarExprAST - Expression class for var/in
+    class VarExprAST : public ExprAST
+    {
+        std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+        std::unique_ptr<ExprAST> Body;
+
+    public:
+        VarExprAST(
+                std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames,
+                std::unique_ptr<ExprAST> Body)
+                : VarNames(std::move(VarNames))
+                , Body(std::move(Body)) {}
+
+        llvm::Value *codegen() override;
+    };
 }
 
 #pragma endregion AST
@@ -469,12 +491,59 @@ namespace Parser
         return std::make_unique<AST::ForExprAST>(IdName, std::move(Start), std::move(End), std::move(Step), std::move(Body));
     }
 
+    /// varexpr ::= 'var' identifier ('=' expression)? (',' identifier ('=' expression)?)* 'in' expression
+    static std::unique_ptr<AST::ExprAST> ParseVarExpr()
+    {
+        getNextToken();  // eat the var.
+
+        std::vector<std::pair<std::string, std::unique_ptr<AST::ExprAST>>> VarNames;
+
+        // At least one variable name is required.
+        if (CurTok != Lexer::tok_identifier)
+            return LogError("expected identifier after var");
+
+        while (1) {
+            std::string Name = Lexer::IdentifierStr;
+            getNextToken();  // eat identifier.
+
+            // Read the optional initializer.
+            std::unique_ptr<AST::ExprAST> Init;
+            if (CurTok == '=') {
+                getNextToken(); // eat the '='.
+
+                Init = ParseExpression();
+                if (!Init) return nullptr;
+            }
+
+            VarNames.push_back(std::make_pair(Name, std::move(Init)));
+
+            // End of var list, exit loop.
+            if (CurTok != ',') break;
+            getNextToken(); // eat the ','.
+
+            if (CurTok != Lexer::tok_identifier)
+                return LogError("expected identifier list after var");
+        }
+
+        // At this point, we have to have 'in'.
+        if (CurTok != Lexer::tok_in)
+            return LogError("expected 'in' keyword after 'var'");
+        getNextToken();  // eat 'in'.
+
+        auto Body = ParseExpression();
+        if (!Body)
+            return nullptr;
+
+        return std::make_unique<AST::VarExprAST>(std::move(VarNames), std::move(Body));
+    }
+
     /// primary
     ///   ::= identifierexpr
     ///   ::= numberexpr
     ///   ::= parenexpr
     ///   ::= ifexpr
     ///   ::= forexpr
+    ///   ::= varexpr
     static std::unique_ptr<AST::ExprAST> ParsePrimary()
     {
         switch (CurTok) {
@@ -490,6 +559,8 @@ namespace Parser
                 return ParseIfExpr();
             case Lexer::tok_for:
                 return ParseForExpr();
+            case Lexer::tok_var:
+                return ParseVarExpr();
         }
     }
 
@@ -1018,6 +1089,55 @@ llvm::Value *AST::ForExprAST::codegen()
 
     // for expr always returns 0.0.
     return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(*TheContext));
+}
+
+llvm::Value *AST::VarExprAST::codegen()
+{
+    std::vector<llvm::AllocaInst *> OldBindings;
+
+    llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    // Register all variables and emit their initializer.
+    for (unsigned i = 0, e = VarNames.size(); i != e; ++i) {
+        const std::string &VarName = VarNames[i].first;
+        AST::ExprAST *Init = VarNames[i].second.get();
+
+        // Emit the initializer before adding the variable to scope, this prevents
+        // the initializer from referencing the variable itself, and permits stuff
+        // like this:
+        //  var a = 1 in
+        //    var a = a in ...   # refers to outer 'a'.
+        llvm::Value *InitVal;
+        if (Init) {
+            InitVal = Init->codegen();
+            if (!InitVal)
+                return nullptr;
+        } else { // If not specified, use 0.0.
+            InitVal = llvm::ConstantFP::get(*TheContext, llvm::APFloat(0.0));
+        }
+
+        llvm::AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+        Builder->CreateStore(InitVal, Alloca);
+
+        // Remember the old variable binding so that we can restore the binding when
+        // we unrecurse.
+        OldBindings.push_back(NamedValues[VarName]);
+
+        // Remember this binding.
+        NamedValues[VarName] = Alloca;
+    }
+
+    // Codegen the body, now that all vars are in scope.
+    llvm::Value *BodyVal = Body->codegen();
+    if (!BodyVal)
+        return nullptr;
+
+    // Pop all our variables from scope.
+    for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
+        NamedValues[VarNames[i].first] = OldBindings[i];
+
+    // Return the body computation.
+    return BodyVal;
 }
 
 #pragma endregion Code Generation
