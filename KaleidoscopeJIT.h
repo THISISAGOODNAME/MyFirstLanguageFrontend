@@ -23,6 +23,8 @@
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/Orc/IRTransformLayer.h"
+#include "llvm/ExecutionEngine/Orc/CompileOnDemandLayer.h"
+#include "llvm/ExecutionEngine/Orc/EPCIndirectionUtils.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/LLVMContext.h"
@@ -34,6 +36,7 @@ namespace llvm {
         class KaleidoscopeJIT {
         private:
             std::unique_ptr<ExecutionSession> ES;
+            std::unique_ptr<EPCIndirectionUtils> EPCIU;
 
             DataLayout DL;
             MangleAndInterner Mangle;
@@ -41,16 +44,19 @@ namespace llvm {
             RTDyldObjectLinkingLayer ObjectLayer;
             IRCompileLayer CompileLayer;
             IRTransformLayer OptimizerLayer;
+            CompileOnDemandLayer CODLayer;
 
             JITDylib &MainJD;
 
         public:
             KaleidoscopeJIT(std::unique_ptr<ExecutionSession> ES,
+                            std::unique_ptr<EPCIndirectionUtils> EPCIU,
                             JITTargetMachineBuilder JTMB, DataLayout DL)
-                            : ES(std::move(ES)), DL(std::move(DL)), Mangle(*this->ES, this->DL)
+                            : ES(std::move(ES)), EPCIU(std::move(EPCIU)), DL(std::move(DL)), Mangle(*this->ES, this->DL)
                             , ObjectLayer(*this->ES, []() { return std::make_unique<SectionMemoryManager>(); })
                             , CompileLayer(*this->ES, ObjectLayer, std::make_unique<ConcurrentIRCompiler>(std::move(JTMB)))
                             , OptimizerLayer(*this->ES, CompileLayer, optimizeModule)
+                            , CODLayer(*this->ES, OptimizerLayer, this->EPCIU->getLazyCallThroughManager(), [this](){ return this->EPCIU->createIndirectStubsManager(); })
                             , MainJD(this->ES->createBareJITDylib("<main>")) {
                 MainJD.addGenerator(cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(DL.getGlobalPrefix())));
                 if (JTMB.getTargetTriple().isOSBinFormatCOFF()) {
@@ -60,6 +66,8 @@ namespace llvm {
             }
 
             ~KaleidoscopeJIT() {
+                if (auto Err = EPCIU->cleanup())
+                    ES->reportError(std::move(Err));
                 if (auto Err = ES->endSession())
                     ES->reportError(std::move(Err));
             }
@@ -71,6 +79,15 @@ namespace llvm {
 
                 auto ES = std::make_unique<ExecutionSession>(std::move(*EPC));
 
+                auto EPCIU = EPCIndirectionUtils::Create(ES->getExecutorProcessControl());
+                if (!EPCIU)
+                    return EPCIU.takeError();
+
+                (*EPCIU)->createLazyCallThroughManager(*ES, pointerToJITTargetAddress(&handleLazyCallThroughError));
+
+                if (auto Err = setUpInProcessLCTMReentryViaEPCIU(**EPCIU))
+                    return std::move(Err);
+
                 JITTargetMachineBuilder JTMB(
                         ES->getExecutorProcessControl().getTargetTriple());
 
@@ -78,8 +95,8 @@ namespace llvm {
                 if (!DL)
                     return DL.takeError();
 
-                return std::make_unique<KaleidoscopeJIT>(std::move(ES), std::move(JTMB),
-                                                         std::move(*DL));
+                return std::make_unique<KaleidoscopeJIT>(std::move(ES), std::move(*EPCIU),
+                                                         std::move(JTMB), std::move(*DL));
             }
 
             const DataLayout &getDataLayout() const { return DL; }
@@ -116,6 +133,11 @@ namespace llvm {
                 });
 
                 return std::move(TSM);
+            }
+
+            static void handleLazyCallThroughError() {
+                errs() << "LazyCallThrough error: Could not find function body";
+                exit(1);
             }
         };
 
