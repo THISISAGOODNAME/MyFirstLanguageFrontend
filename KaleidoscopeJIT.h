@@ -22,6 +22,7 @@
 #include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
+#include "llvm/ExecutionEngine/Orc/IRTransformLayer.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/LLVMContext.h"
@@ -39,21 +40,19 @@ namespace llvm {
 
             RTDyldObjectLinkingLayer ObjectLayer;
             IRCompileLayer CompileLayer;
+            IRTransformLayer OptimizerLayer;
 
             JITDylib &MainJD;
 
         public:
             KaleidoscopeJIT(std::unique_ptr<ExecutionSession> ES,
                             JITTargetMachineBuilder JTMB, DataLayout DL)
-                            : ES(std::move(ES)), DL(std::move(DL)), Mangle(*this->ES, this->DL),
-                            ObjectLayer(*this->ES,
-                                        []() { return std::make_unique<SectionMemoryManager>(); }),
-                                        CompileLayer(*this->ES, ObjectLayer,
-                                                     std::make_unique<ConcurrentIRCompiler>(std::move(JTMB))),
-                                                     MainJD(this->ES->createBareJITDylib("<main>")) {
-                MainJD.addGenerator(
-                        cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(
-                                DL.getGlobalPrefix())));
+                            : ES(std::move(ES)), DL(std::move(DL)), Mangle(*this->ES, this->DL)
+                            , ObjectLayer(*this->ES, []() { return std::make_unique<SectionMemoryManager>(); })
+                            , CompileLayer(*this->ES, ObjectLayer, std::make_unique<ConcurrentIRCompiler>(std::move(JTMB)))
+                            , OptimizerLayer(*this->ES, CompileLayer, optimizeModule)
+                            , MainJD(this->ES->createBareJITDylib("<main>")) {
+                MainJD.addGenerator(cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(DL.getGlobalPrefix())));
                 if (JTMB.getTargetTriple().isOSBinFormatCOFF()) {
                     ObjectLayer.setOverrideObjectFlagsWithResponsibilityFlags(true);
                     ObjectLayer.setAutoClaimResponsibilityForObjectSymbols(true);
@@ -90,11 +89,33 @@ namespace llvm {
             Error addModule(ThreadSafeModule TSM, ResourceTrackerSP RT = nullptr) {
                 if (!RT)
                     RT = MainJD.getDefaultResourceTracker();
-                return CompileLayer.add(RT, std::move(TSM));
+                //return CompileLayer.add(RT, std::move(TSM));
+                return OptimizerLayer.add(RT, std::move(TSM));
             }
 
             Expected<JITEvaluatedSymbol> lookup(StringRef Name) {
                 return ES->lookup({&MainJD}, Mangle(Name.str()));
+            }
+
+        private:
+            static Expected<ThreadSafeModule> optimizeModule(ThreadSafeModule TSM, const MaterializationResponsibility &R) {
+                TSM.withModuleDo([](Module &M) {
+                    // Create a function pass manager.
+                    auto FPM = std::make_unique<legacy::FunctionPassManager>(&M);
+
+                    // Add some optimizations.
+                    FPM->add(createInstructionCombiningPass());
+                    FPM->add(createReassociatePass());
+                    FPM->add(createGVNPass());
+                    FPM->add(createCFGSimplificationPass());
+
+                    // Run the optimizations over all functions in the module being added to the JIT.
+                    for (auto &F: M) {
+                        FPM->run(F);
+                    }
+                });
+
+                return std::move(TSM);
             }
         };
 
